@@ -1,0 +1,116 @@
+name: Habbo Flash Releases
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Tag from the private source repository, such as habbo-flash-v0.1.1
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: habbo-flash-release-feed
+  cancel-in-progress: false
+
+jobs:
+  package:
+    name: Build and publish Windows installers
+    runs-on: windows-latest
+    steps:
+      - name: Check out private source
+        uses: actions/checkout@v4
+        with:
+          repository: Sebastianbxa/habbo-flash-browser
+          ref: ${{ inputs.source_ref }}
+          path: havana-browser
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: havana-browser/package-lock.json
+
+      - name: Check source tag and app version
+        shell: pwsh
+        env:
+          SOURCE_REF: ${{ inputs.source_ref }}
+        run: |
+          $packageVersion = node -p "require('./package.json').version"
+          $expectedTag = "habbo-flash-v$packageVersion"
+          if ($env:SOURCE_REF -ne $expectedTag) {
+            throw "source_ref must be $expectedTag to match package.json."
+          }
+        working-directory: havana-browser
+
+      - name: Install dependencies
+        run: npm ci
+        working-directory: havana-browser
+
+      - name: Build installers
+        run: npm run release
+        working-directory: havana-browser
+
+      - name: Publish version release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $repository = "Sebastianbxa/habbo-flash-releases"
+          $version = node -p "require('./package.json').version"
+          $tag = "habbo-flash-v$version"
+          $core = "havana-browser/release/Habbo-Flash-Core-$version.exe"
+          $setup = "havana-browser/release/setup/Habbo-Flash-Setup-$version.exe"
+          $manifest = "havana-browser/release/latest.yml"
+          $blockmap = "$core.blockmap"
+          $assets = @($core, $blockmap, $setup, $manifest)
+
+          foreach ($asset in $assets) {
+            if (-not (Test-Path -LiteralPath $asset)) { throw "Missing release asset: $asset" }
+          }
+
+          & gh release view $tag --repo $repository *> $null
+          if ($LASTEXITCODE -eq 0) {
+            & gh release upload $tag @assets --repo $repository --clobber
+          } else {
+            & gh release create $tag @assets --repo $repository --title "Habbo Flash $version" --notes "Instalador de Habbo Flash para Windows." --target main --latest
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Could not publish release $tag." }
+
+      - name: Update public update feed
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $repository = "Sebastianbxa/habbo-flash-releases"
+          $version = node -p "require('./package.json').version"
+          $feedTag = "habbo-flash-latest"
+          $core = "havana-browser/release/Habbo-Flash-Core-$version.exe"
+          $manifest = "havana-browser/release/latest.yml"
+          $blockmap = "$core.blockmap"
+          $assets = @($manifest, $core, $blockmap)
+
+          & gh release view $feedTag --repo $repository *> $null
+          if ($LASTEXITCODE -ne 0) {
+            & gh release create $feedTag --repo $repository --title "Habbo Flash · canal de actualizaciones" --notes "Feed público de actualización de Habbo Flash." --target main --latest=false
+            if ($LASTEXITCODE -ne 0) { throw "Could not create the update feed release." }
+          } else {
+            $oldAssets = @(& gh release view $feedTag --repo $repository --json assets --jq '.assets[].name')
+            if ($LASTEXITCODE -ne 0) { throw "Could not list update feed assets." }
+            foreach ($asset in $oldAssets) {
+              if ($asset) {
+                & gh release delete-asset $feedTag $asset --repo $repository --yes
+                if ($LASTEXITCODE -ne 0) { throw "Could not replace update asset $asset." }
+              }
+            }
+          }
+
+          & gh release upload $feedTag @assets --repo $repository --clobber
+          if ($LASTEXITCODE -ne 0) { throw "Could not upload assets to the update feed." }
